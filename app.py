@@ -65,8 +65,8 @@ if not check_password():
 # データ取得（キャッシュ付きラッパー）
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
-def fetch_financials(code: str, _refresh_token: str):
-    client = ds.JQuantsClient(_refresh_token)
+def fetch_financials(code: str, _api_key: str):
+    client = ds.JQuantsClient(_api_key)
     raw_statements = client.get_statements_raw(code)
     financials_df = ds.statements_to_financials_df(raw_statements)
     forecast = ds.extract_latest_company_forecast(raw_statements)
@@ -74,8 +74,8 @@ def fetch_financials(code: str, _refresh_token: str):
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
-def fetch_margin(code: str, _refresh_token: str):
-    client = ds.JQuantsClient(_refresh_token)
+def fetch_margin(code: str, _api_key: str):
+    client = ds.JQuantsClient(_api_key)
     raw = client.get_weekly_margin_interest_raw(code)
     return ds.weekly_margin_to_df(raw)
 
@@ -108,7 +108,7 @@ with col_input:
 with col_period:
     period = st.selectbox("株価取得期間", ["6mo", "1y", "2y", "5y"], index=2)
 
-jquants_token = get_secret("JQUANTS_REFRESH_TOKEN", "")
+jquants_token = get_secret("JQUANTS_API_KEY", "")
 anthropic_key = get_secret("ANTHROPIC_API_KEY", "")
 
 if not code:
@@ -150,8 +150,9 @@ ppm_result = None
 with tab_fundamental:
     if not jquants_token:
         st.warning(
-            "J-Quants の refresh token が設定されていません。"
-            ".streamlit/secrets.toml に JQUANTS_REFRESH_TOKEN を設定してください。"
+            "J-Quants の API Key が設定されていません。"
+            ".streamlit/secrets.toml（またはStreamlit CloudのSecrets）に "
+            "JQUANTS_API_KEY を設定してください。"
             "（財務データ・会社予想・信用残高の取得に使用します）"
         )
     else:
