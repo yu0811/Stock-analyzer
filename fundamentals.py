@@ -62,9 +62,9 @@ def calculate_fundamental_ratios(financials: pd.DataFrame) -> pd.DataFrame:
     out["総資産回転率(回)"] = df["revenue"] / df["total_assets"]
 
     # --- 成長性（前期比） ---
-    out["売上高成長率(%)"] = df["revenue"].pct_change() * 100
-    out["経常利益成長率(%)"] = df["ordinary_income"].pct_change() * 100
-    out["純利益成長率(%)"] = df["net_income"].pct_change() * 100
+    out["売上高成長率(%)"] = df["revenue"].pct_change(fill_method=None) * 100
+    out["経常利益成長率(%)"] = df["ordinary_income"].pct_change(fill_method=None) * 100
+    out["純利益成長率(%)"] = df["net_income"].pct_change(fill_method=None) * 100
 
     # --- キャッシュフロー ---
     out["営業CF"] = df["operating_cf"]
@@ -89,6 +89,39 @@ def calculate_valuation(current_price: float, eps: float, bps: float) -> dict:
 def last_5_years(ratios: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     """直近n期分を抽出する。"""
     return ratios.tail(n)
+
+
+# PL(損益計算書)の実績表示に使う項目。(内部列名, 表示ラベル) の順。
+# 売上総利益(粗利)は、J-Quants無料/Lightプランの財務情報サマリーAPIには含まれず、
+# 詳細BS/PL/CF(/fins/details、Standardプラン以上)でのみ取得可能なため、
+# データがない場合は空欄で表示される。
+PL_ITEMS = [
+    ("revenue", "売上高"),
+    ("gross_profit", "売上総利益(粗利)"),
+    ("operating_income", "営業利益"),
+    ("ordinary_income", "経常利益"),
+    ("net_income", "純利益"),
+]
+
+
+def build_pl_table(financials: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    """
+    過去n期分のPL実績推移表を作る（単位: 億円）。
+    各項目について「実績(億円)」と「前期比(%)」を並べて表示する。
+    financials は fiscal_year 昇順（古い年度が先）を想定。
+    """
+    df = financials.copy().sort_index()
+    if "gross_profit" not in df.columns:
+        df["gross_profit"] = np.nan
+
+    out = pd.DataFrame(index=df.tail(n).index)
+    out.index.name = "決算期"
+    for col, label in PL_ITEMS:
+        oku = df[col] / 1e8
+        yoy = df[col].pct_change(fill_method=None) * 100
+        out[f"{label}(億円)"] = oku.tail(n).round(1)
+        out[f"{label} 前期比(%)"] = yoy.tail(n).round(1)
+    return out
 
 
 def format_company_forecast(forecast: dict) -> pd.DataFrame:
