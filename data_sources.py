@@ -236,24 +236,49 @@ class JQuantsClient:
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _extract_list(data: dict, preferred_keys: tuple[str, ...]) -> list[dict]:
+        """
+        レスポンスJSONの中からデータのリスト部分を取り出す。
+        V2移行でレスポンスのラッパーキー名も変わった可能性があるため、
+        想定キー名を優先しつつ、見つからなければ「リスト型の値を持つ最初のキー」を
+        使うフォールバックを行う（キー名が想定と違っていても壊れないようにするため）。
+        """
+        for key in preferred_keys:
+            if isinstance(data.get(key), list):
+                return data[key]
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+        return []
+
     def get_statements_raw(self, code: str) -> list[dict]:
-        """/fins/statements の生データ(決算短信ベースの開示情報)を取得する。"""
-        data = self._get("/fins/statements", {"code": code})
-        return data.get("statements", [])
+        """
+        決算短信ベースの財務情報サマリーの生データを取得する。
+        V2移行で /fins/statements から /fins/summary にエンドポイント名が変更された
+        （旧パスは403 Forbiddenになる）。
+        """
+        data = self._get("/fins/summary", {"code": code})
+        return self._extract_list(data, ("statements", "summary"))
 
     def get_weekly_margin_interest_raw(self, code: str) -> list[dict]:
-        """/markets/weekly_margin_interest の生データ(週次信用残高)を取得する。"""
+        """
+        週次信用残高の生データを取得する（Standardプラン以上が必要）。
+        注意: V2でのエンドポイント名は未確認（この開発環境では実地検証できていない）。
+        取得に失敗した場合、呼び出し元(app.py)は日証金の無料データに自動フォールバックする。
+        """
         data = self._get("/markets/weekly_margin_interest", {"code": code})
-        return data.get("weekly_margin_interest", [])
+        return self._extract_list(data, ("weekly_margin_interest",))
 
     def get_short_selling_raw(self, sector33_code: str) -> list[dict]:
         """
-        /markets/short_selling の生データを取得する。
+        /markets/short_selling の生データを取得する（Standardプラン以上が必要）。
         注意: このエンドポイントは業種(33業種)単位の空売り集計であり、
         個別銘柄ごとの空売り比率ではない。参考情報として扱うこと。
+        V2でのエンドポイント名は未確認（この開発環境では実地検証できていない）。
         """
         data = self._get("/markets/short_selling", {"sector33code": sector33_code})
-        return data.get("short_selling", [])
+        return self._extract_list(data, ("short_selling",))
 
 
 def debug_dump_raw_statement(client: JQuantsClient, code: str) -> None:
@@ -266,30 +291,38 @@ def debug_dump_raw_statement(client: JQuantsClient, code: str) -> None:
 # J-Quants /fins/statements -> fundamentals.py 用スキーマへの変換
 # ---------------------------------------------------------------------------
 
-# 内部で使うキー -> J-Quants APIのレスポンス項目名（想定・要検証）
+# 内部で使うキー -> J-Quants APIのレスポンス項目名。
+# V2移行(2025年12月)でカラム名が短縮形に変更された。以下は実際にV2の
+# /fins/summary を呼び出した実例(コミュニティ記事)で確認されたカラム名
+# ['DiscDate','DiscTime','Code','DiscNo','DocType','CurPerType','CurPerSt',
+#  'CurPerEn','CurFYSt','CurFYEn','NxtFYSt','NxtFYEn','Sales','OP','OdP','NP',
+#  'EPS','DEPS','TA','Eq','EqAR','BPS','CFO','CFI','CFF','CashEq', ...
+#  'NxFSales','NxFOP','NxFOdP','NxFNp','NxFEPS', ...] に基づく対応表。
+# 銘柄やプランによって欠けている列がある可能性はあるため、値が想定と違う場合は
+# `debug_dump_raw_statement()` で実際のキー名を確認すること。
 FIELD_MAP = {
-    "fiscal_year_end": "CurrentFiscalYearEndDate",
-    "period_type": "TypeOfCurrentPeriod",   # 'FY','1Q','2Q','3Q'
-    "doc_type": "TypeOfDocument",
-    "revenue": "NetSales",
-    "operating_income": "OperatingProfit",
-    "ordinary_income": "OrdinaryProfit",
-    "net_income": "Profit",
-    "eps": "EarningsPerShare",
-    "total_assets": "TotalAssets",
-    "equity": "Equity",
-    "equity_ratio": "EquityToAssetRatio",
-    "bps": "BookValuePerShare",
-    "operating_cf": "CashFlowsFromOperatingActivities",
-    "investing_cf": "CashFlowsFromInvestingActivities",
-    "financing_cf": "CashFlowsFromFinancingActivities",
-    "shares_outstanding": "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
-    # 会社予想（来期。本決算開示時に同時に開示される）
-    "next_fy_revenue_forecast": "NextYearForecastNetSales",
-    "next_fy_operating_income_forecast": "NextYearForecastOperatingProfit",
-    "next_fy_ordinary_income_forecast": "NextYearForecastOrdinaryProfit",
-    "next_fy_net_income_forecast": "NextYearForecastProfit",
-    "next_fy_eps_forecast": "NextYearForecastEarningsPerShare",
+    "fiscal_year_end": "CurFYEn",
+    "period_type": "CurPerType",   # 'FY','1Q','2Q','3Q'
+    "doc_type": "DocType",
+    "revenue": "Sales",
+    "operating_income": "OP",
+    "ordinary_income": "OdP",
+    "net_income": "NP",
+    "eps": "EPS",
+    "total_assets": "TA",
+    "equity": "Eq",
+    "equity_ratio": "EqAR",
+    "bps": "BPS",
+    "operating_cf": "CFO",
+    "investing_cf": "CFI",
+    "financing_cf": "CFF",
+    "shares_outstanding": "ShOutFY",
+    # 会社予想（来期。本決算開示時に同時に開示される。通期分を使う）
+    "next_fy_revenue_forecast": "NxFSales",
+    "next_fy_operating_income_forecast": "NxFOP",
+    "next_fy_ordinary_income_forecast": "NxFOdP",
+    "next_fy_net_income_forecast": "NxFNp",
+    "next_fy_eps_forecast": "NxFEPS",
 }
 
 
@@ -304,7 +337,7 @@ def _to_float(v):
 
 def statements_to_financials_df(raw_statements: list[dict]) -> pd.DataFrame:
     """
-    J-Quants /fins/statements の生データを、fundamentals.py が期待する
+    J-Quants /fins/summary の生データを、fundamentals.py が期待する
     financials DataFrame（fiscal_year をindexに、revenue/operating_income等を列に持つ）
     に変換する。本決算(FY)の開示のみを対象に、年度ごとの実績値を抽出する。
     """
@@ -342,8 +375,8 @@ def extract_latest_company_forecast(raw_statements: list[dict]) -> dict:
     """直近の開示から、来期の会社予想を抽出する。"""
     if not raw_statements:
         return {}
-    # 開示日が最も新しいものを採用
-    date_field = "DisclosedDate"
+    # 開示日が最も新しいものを採用（V2では DiscDate というカラム名になった）
+    date_field = "DiscDate"
     latest = sorted(raw_statements, key=lambda s: s.get(date_field, ""), reverse=True)[0]
     return {
         "fiscal_year_end": latest.get(FIELD_MAP["fiscal_year_end"]),
