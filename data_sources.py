@@ -8,16 +8,20 @@
     無料のまま信用倍率の推移グラフを作れる（詳しくは get_taisyaku_margin_snapshot
     のdocstring参照）。J-Quants Standardプラン(3,300円/月)を使わずに済む。
   - J-Quants API: 財務情報(決算短信ベース)・信用残高(週次、Standardプラン以上)を取得。
-    無料登録が必要 (https://jpx-jquants.com/ 。refresh token を取得して
-    .streamlit/secrets.toml か環境変数 JQUANTS_REFRESH_TOKEN に設定する)。
+    無料登録が必要 (https://jpx-jquants.com/ 。ダッシュボードの「API Key」ページで
+    発行される文字列を .streamlit/secrets.toml か環境変数 JQUANTS_API_KEY に設定する)。
 
 【重要な注意】
-J-Quants /fins/statements のレスポンスの項目名(FIELD_MAP内)は、公式ドキュメント
-(https://jpx.gitbook.io/j-quants-ja/api-reference/statements) をもとにした
-best-effort の対応表です。J-Quants側の仕様変更や、この開発時点で実機検証できなかった
-ことにより、実際のレスポンスと項目名がずれる可能性があります。
-初回実行時は `debug_dump_raw_statement()` で生JSONを出力し、
-FIELD_MAP を実際のキー名に合わせて調整してください。
+2025年12月にJ-Quants APIがV2に移行し、(1)認証方式が「リフレッシュトークン」から
+「APIキー」(ヘッダー x-api-key)に変更、(2)レスポンスの項目名(カラム名)が短縮形に
+変更、という2点の破壊的変更があった(V1は2026年6月1日に廃止済み)。
+本モジュールは認証部分はV2の x-api-key 方式に対応済みだが、
+J-Quants /fins/statements のレスポンス項目名(FIELD_MAP内)は、V1時点の
+公式ドキュメント(https://jpx.gitbook.io/j-quants-ja/api-reference/statements)を
+もとにしたbest-effortの対応表であり、V2のカラム名短縮により実際のキー名と
+ずれている可能性が高い。財務データ・会社予想が空欄/おかしい値になる場合は、
+`debug_dump_raw_statement()` で生JSONを1度出力し、実際のキー名を確認のうえ
+FIELD_MAP を書き換えること。
 
 同様に、日証金CSVの列位置(TAISYAKU_COL_*)も、開発環境のネットワーク制限により
 実際のCSVを取得してのカラム名検証ができておらず、公開されている解説ページの記述と
@@ -35,7 +39,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-JQUANTS_BASE_URL = "https://api.jquants.com/v1"
+JQUANTS_BASE_URL = "https://api.jquants.com/v2"
 TAISYAKU_ZANDAKA_URL = "http://www.taisyaku.jp/data/zandaka.csv"
 
 # zandaka.csv の列位置（0始まり）。日証金の解説ページと、公開データの手動突き合わせによる推定値。
@@ -54,6 +58,38 @@ MARGIN_HISTORY_DIR = os.path.join(os.path.dirname(__file__), "margin_history")
 # yfinance: 株価データ
 # ---------------------------------------------------------------------------
 
+# Streamlit Community Cloud等、共有IPからのアクセスはYahoo Finance側に
+# 「Too Many Requests」としてレート制限されることがある。ブラウザに近い
+# User-Agentを付けたセッションを使い回すことで発生頻度を下げる。
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+})
+
+
+def _call_with_retry(fn, retries: int = 3, base_delay: float = 2.0):
+    """
+    yfinance呼び出し用のリトライヘルパー。
+    「Too Many Requests」等の一時的なレート制限エラーの場合のみ、
+    指数バックオフ（2秒→4秒→8秒）で再試行する。
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e)
+            is_rate_limit = "Too Many Requests" in msg or "429" in msg or "Rate limited" in msg
+            if not is_rate_limit or attempt == retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    raise last_err  # pragma: no cover
+
+
 def to_yfinance_ticker(code: str) -> str:
     """4桁の証券コードを yfinance 形式（末尾に .T）に変換する。"""
     code = code.strip()
@@ -69,18 +105,23 @@ def get_price_history(code: str, period: str = "2y") -> pd.DataFrame:
     period: yfinance の period 指定 ('6mo','1y','2y','5y' など)
     """
     ticker = to_yfinance_ticker(code)
-    df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-    if df.empty:
-        raise ValueError(f"株価データが取得できませんでした: {ticker}")
+
+    def _fetch():
+        df = yf.Ticker(ticker, session=_YF_SESSION).history(period=period, auto_adjust=False)
+        if df.empty:
+            raise ValueError(f"株価データが取得できませんでした: {ticker}")
+        return df
+
+    df = _call_with_retry(_fetch)
     df.index = df.index.tz_localize(None)
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-@st.cache_data(ttl=60 * 30, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def get_company_profile(code: str) -> dict:
     """yfinanceから会社の簡易プロフィール(社名・セクター等)を取得する。"""
     ticker = to_yfinance_ticker(code)
-    info = yf.Ticker(ticker).info
+    info = _call_with_retry(lambda: yf.Ticker(ticker, session=_YF_SESSION).info)
     return {
         "name": info.get("longName") or info.get("shortName"),
         "sector": info.get("sector"),
@@ -178,32 +219,19 @@ def append_and_load_margin_history(code: str, snapshot: dict) -> pd.DataFrame:
 class JQuantsClient:
     """
     J-Quants APIクライアント（無料プラン想定）。
-    refresh_token は https://jpx-jquants.com/ で無料登録後に発行される。
+
+    2025年12月のJ-Quants API V2移行により、認証方式が
+    「リフレッシュトークン→IDトークン」の2段階方式から、
+    シンプルな「APIキー」方式（ヘッダー x-api-key）に変更された。
+    APIキーは https://jpx-jquants.com/ のダッシュボード内
+    「API Keys」ページで発行・確認できる。
     """
 
-    def __init__(self, refresh_token: str):
-        self.refresh_token = refresh_token
-        self._id_token = None
-        self._id_token_fetched_at = None
-
-    def _get_id_token(self) -> str:
-        # idToken は有効期限があるため、24時間以内ならキャッシュを再利用する
-        if self._id_token and self._id_token_fetched_at and \
-                datetime.now() - self._id_token_fetched_at < timedelta(hours=12):
-            return self._id_token
-
-        resp = requests.post(
-            f"{JQUANTS_BASE_URL}/token/auth_refresh",
-            params={"refreshtoken": self.refresh_token},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        self._id_token = resp.json()["idToken"]
-        self._id_token_fetched_at = datetime.now()
-        return self._id_token
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 
     def _get(self, path: str, params: dict) -> dict:
-        headers = {"Authorization": f"Bearer {self._get_id_token()}"}
+        headers = {"x-api-key": self.api_key}
         resp = requests.get(f"{JQUANTS_BASE_URL}{path}", headers=headers, params=params, timeout=20)
         resp.raise_for_status()
         return resp.json()
