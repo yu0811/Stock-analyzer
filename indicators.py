@@ -128,6 +128,31 @@ def compute_margin_ratio(margin_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# 表示期間ラベル -> 末尾から遡る期間。
+# 移動平均線(200日)等を正しく計算するため、株価データ自体は常に長期間(既定10年)を
+# 取得しておき、画面表示の絞り込みはこのオフセットを使って行う
+# （こうすることで「1ヶ月」表示を選んでも、その1ヶ月間のMA200が
+# ちゃんと過去のデータに基づいて計算された状態で表示できる）。
+PERIOD_OFFSETS = {
+    "1日": pd.DateOffset(days=1),
+    "1週間": pd.DateOffset(weeks=1),
+    "1ヶ月": pd.DateOffset(months=1),
+    "6ヶ月": pd.DateOffset(months=6),
+    "1年": pd.DateOffset(years=1),
+    "2年": pd.DateOffset(years=2),
+    "5年": pd.DateOffset(years=5),
+    "10年": pd.DateOffset(years=10),
+}
+
+
+def slice_by_period(df: pd.DataFrame, period_label: str) -> pd.DataFrame:
+    """指標計算済みのDataFrameから、表示期間ラベルに応じた末尾部分を切り出す。"""
+    if df.empty or period_label not in PERIOD_OFFSETS:
+        return df
+    cutoff = df.index.max() - PERIOD_OFFSETS[period_label]
+    return df.loc[df.index >= cutoff]
+
+
 def build_all_technical_indicators(price_df: pd.DataFrame) -> pd.DataFrame:
     """全テクニカル指標をまとめて計算するヘルパー。"""
     df = price_df.copy()
