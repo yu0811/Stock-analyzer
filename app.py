@@ -106,7 +106,8 @@ col_input, col_period = st.columns([2, 1])
 with col_input:
     code = st.text_input("銘柄コード（例: 7203 = トヨタ自動車）", key="code")
 with col_period:
-    period = st.selectbox("株価取得期間", ["6mo", "1y", "2y", "5y"], index=2)
+    period_options = ["1日", "1週間", "1ヶ月", "6ヶ月", "1年", "2年", "5年", "10年"]
+    period_label = st.selectbox("株価表示期間", period_options, index=5)
 
 jquants_token = get_secret("JQUANTS_API_KEY", "")
 anthropic_key = get_secret("ANTHROPIC_API_KEY", "")
@@ -175,7 +176,16 @@ with tab_fundamental:
                     c3.metric("ROE(%)", f"{latest.get('ROE(%)', float('nan')):.2f}")
                     c4.metric("自己資本比率(%)", f"{latest.get('自己資本比率(%)', float('nan')):.2f}")
 
-                st.markdown("#### 過去5年の業績・財務指標推移")
+                st.markdown("#### 過去5年の業績（PL実績）")
+                pl_table = fnd.build_pl_table(financials_df, 5)
+                st.dataframe(pl_table, width='stretch')
+                st.caption(
+                    "単位: 億円。前期比はその期の前年同期比(%)。"
+                    "「売上総利益(粗利)」はJ-Quantsの無料/Lightプランの財務情報サマリーには含まれないため、"
+                    "空欄になる場合があります（詳細BS/PL/CFはStandardプラン以上が必要）。"
+                )
+
+                st.markdown("#### 過去5年の財務指標（比率）推移")
                 st.dataframe(fnd.last_5_years(ratios, 5).round(2), width='stretch')
 
                 st.markdown("#### 来期 会社予想（決算短信ベース）")
@@ -222,11 +232,17 @@ with tab_fundamental:
 # タブ2: テクニカル分析
 # ---------------------------------------------------------------------------
 tech_df = None
+tech_df_full = None
 margin_df = None
 with tab_technical:
     try:
-        price_df = ds.get_price_history(code, period=period)
-        tech_df = ind.build_all_technical_indicators(price_df)
+        # 移動平均線(200日)等が短い表示期間でも正しく計算されるよう、
+        # 常に長期間(既定10年)の株価データを取得してから指標を計算し、
+        # 画面表示だけを選択された期間で絞り込む。
+        price_df = ds.get_price_history(code)
+        tech_df_full = ind.build_all_technical_indicators(price_df)
+        tech_df = ind.slice_by_period(tech_df_full, period_label)
+        latest_row = tech_df_full.iloc[-1]
 
         overlay_choice = st.radio(
             "価格チャートに重ねる指標を選択",
@@ -287,6 +303,19 @@ with tab_technical:
         fig.update_layout(height=900, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
         st.plotly_chart(fig, width='stretch')
 
+        # --- 各指標の見立て（無料・ルールベースの自動コメント） ---
+        st.markdown("#### 各指標の見立て（ルールベース・自動生成）")
+        st.markdown(f"**移動平均線:** {free_diagnosis.comment_ma(latest_row)}")
+        st.markdown(f"**MACD:** {free_diagnosis.comment_macd(latest_row)}")
+        st.markdown(f"**RSI:** {free_diagnosis.comment_rsi(latest_row)}")
+        st.markdown(f"**ボリンジャーバンド:** {free_diagnosis.comment_bb(latest_row)}")
+        st.markdown(f"**一目均衡表:** {free_diagnosis.comment_ichimoku(latest_row)}")
+        st.markdown(f"**出来高:** {free_diagnosis.comment_volume(latest_row)}")
+        st.caption(
+            "※定型ルールに基づく機械的なコメントであり、将来の値動きを保証するものではありません。"
+            "投資判断はご自身の責任で行ってください。"
+        )
+
         # --- 信用倍率 ---
         # 優先順位: ①J-Quants(Standardプラン以上)の週次データがあれば最初からフル履歴を表示
         #           ②なければ日証金の無料CSV(登録不要)を使い、今日のスナップショットを
@@ -304,6 +333,7 @@ with tab_technical:
                     fig_margin.update_layout(height=300)
                     st.plotly_chart(fig_margin, width='stretch')
                     st.caption("J-Quants(Standardプラン以上)の週次信用残高データに基づく。")
+                    st.markdown(f"**信用倍率:** {free_diagnosis.comment_margin(margin_df['margin_ratio'].iloc[-1])}")
                     margin_shown = True
             except Exception as e:
                 st.info(f"J-Quantsの信用残高データは利用できませんでした（Standardプラン未契約の可能性があります）: {e}")
@@ -332,6 +362,7 @@ with tab_technical:
                         "グラフは使い始めた日からの履歴のみとなります。"
                         "最初から数年分の履歴が欲しい場合はJ-Quants Standardプラン(3,300円/月)をご検討ください。"
                     )
+                    st.markdown(f"**信用倍率:** {free_diagnosis.comment_margin(snapshot['margin_ratio'])}")
             except Exception as e:
                 st.warning(f"信用残高データの取得に失敗しました: {e}")
 
@@ -343,13 +374,15 @@ with tab_technical:
 # タブ3: 総合診断
 # ---------------------------------------------------------------------------
 with tab_overall:
-    if ratios is None or tech_df is None:
+    if ratios is None or tech_df_full is None:
         st.info("ファンダメンタル・テクニカル両方のデータが揃うと診断コメントを生成できます。")
     else:
         latest_ratios = ratios.iloc[-1]
-        latest_tech = tech_df.iloc[-1]
-        ma_cross_series = tech_df[tech_df["cross"].notna()]
-        macd_cross_series = tech_df[tech_df["MACD_cross"].notna()]
+        # 表示期間の絞り込み(period_label)に関わらず、常に最新の状態で判定するため
+        # ここでは画面表示用に切り出す前の tech_df_full を使う。
+        latest_tech = tech_df_full.iloc[-1]
+        ma_cross_series = tech_df_full[tech_df_full["cross"].notna()]
+        macd_cross_series = tech_df_full[tech_df_full["MACD_cross"].notna()]
         last_ma_cross = ma_cross_series["cross"].iloc[-1] if not ma_cross_series.empty else None
         last_macd_cross = macd_cross_series["MACD_cross"].iloc[-1] if not macd_cross_series.empty else None
         margin_ratio_latest = margin_df["margin_ratio"].iloc[-1] if margin_df is not None and not margin_df.empty else None
